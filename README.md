@@ -7,7 +7,7 @@
 <p align="center">
   <a href="https://cvpr.thecvf.com/Conferences/2026"><img src="https://img.shields.io/badge/CVPR-2026-4b44ce.svg?style=flat-square" alt="CVPR 2026"></a>
   <a href="https://arxiv.org/abs/2606.03985"><img src="https://img.shields.io/badge/arXiv-2606.03985-b31b1b.svg?style=flat-square" alt="arXiv"></a>
-  <a href="https://qizekun.github.io/humanoid-gpt/"><img src="https://img.shields.io/badge/Project-Page-blue.svg?style=flat-square" alt="Project Page"></a>
+  <a href="https://qizekun.github.io/Humanoid-GPT/"><img src="https://img.shields.io/badge/Project-Page-blue.svg?style=flat-square" alt="Project Page"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green.svg?style=flat-square" alt="License"></a>
 </p>
 
