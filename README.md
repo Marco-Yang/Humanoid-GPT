@@ -1,12 +1,12 @@
 <div align="center">
 
-# 🤖 Humanoid-GPT (Inference & Deployment Release)
+# 🤖 Humanoid-GPT
 
 ### [CVPR 2026] Humanoid Generative Pre-Training for Zero-Shot Motion Tracking
 
 <p align="center">
   <a href="https://cvpr.thecvf.com/Conferences/2026"><img src="https://img.shields.io/badge/CVPR-2026-4b44ce.svg?style=flat-square" alt="CVPR 2026"></a>
-  <a href="https://arxiv.org/abs/2605.xxxxx"><img src="https://img.shields.io/badge/arXiv-2602.xxxxx-b31b1b.svg?style=flat-square" alt="arXiv"></a>
+  <a href="https://arxiv.org/abs/2606.03985"><img src="https://img.shields.io/badge/arXiv-2606.03985-b31b1b.svg?style=flat-square" alt="arXiv"></a>
   <a href="https://github.com/qizekun/Humanoid-GPT"><img src="https://img.shields.io/badge/Project-Page-blue.svg?style=flat-square" alt="Project Page"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-green.svg?style=flat-square" alt="License"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.12-3776AB.svg?style=flat-square&logo=python&logoColor=white" alt="Python 3.12"></a>
@@ -19,11 +19,6 @@
 </div>
 
 ---
-
-> **Note** This repository is the **inference & deployment release** of Humanoid-GPT.
-> It ships the runtime stack needed to **run a pre-trained policy** in simulation
-> and on the Unitree G1 robot. Training code, large-scale data pipelines, and
-> internal experiments are **not** included — see the full research repository for those.
 
 ## 📖 Overview
 
@@ -77,20 +72,8 @@ On MacOS, use `mjpython` instead of `python` for the MuJoCo viewer (e.g. `mjpyth
 We support multiple Unitree G1 hardware versions via the `G1_VERSION` env var (default `5010`). The asset folder `storage/assets/unitree_g1_${G1_VERSION}/` is selected automatically:
 
 ```bash
-G1_VERSION=4010 python -m scripts.inference ...   # use 4010 assets
 python -m scripts.inference ...                   # default: 5010
 ```
-
-### 🎚️ PD Gain Scale
-
-The global PD gain multiplier is controlled by the `BASE_KP_KD_SCALE` env var (default `1.0`). It scales every joint's `KPs` by `BASE_KP_KD_SCALE**2` and every joint's `KDs` by `BASE_KP_KD_SCALE` (also rescaling `ACTION_SCALE = TORQUE_LIMIT / KPs`). Use it to soften or stiffen the controller globally without editing code:
-
-```bash
-BASE_KP_KD_SCALE=0.8 python -m scripts.inference ...   # softer PD
-BASE_KP_KD_SCALE=1.2 python -m scripts.inference ...   # stiffer PD
-```
-
-> The `KPs` / `KDs` / `ACTION_SCALE` constants are computed at module import time from this env var, so use the same value the policy was trained with.
 
 ---
 
@@ -171,7 +154,7 @@ Humanoid-GPT/
 @article{humanoid-gpt26,
     title     = {Humanoid-GPT: Humanoid Generative Pre-Training for Zero-Shot Motion Tracking},
     author    = {Qi, Zekun and Chen, Xuchuan and others},
-    journal   = {arXiv preprint arXiv:2605.xxxxx},
+    journal   = {arXiv preprint arXiv:2606.03985},
     year      = {2026}
 }
 ```
@@ -181,5 +164,3 @@ Humanoid-GPT/
 ## 📄 License · Acknowledgments
 
 Licensed under **Apache 2.0**. Built on top of [MuJoCo](https://mujoco.org/), [Brax](https://github.com/google/brax) and the [Unitree](https://www.unitree.com/) G1 platform.
-
-Built with ❤️ by the Humanoid-GPT Team
