@@ -2,7 +2,7 @@
 
 # 🤖 Humanoid-GPT
 
-### [CVPR 2026] Humanoid Generative Pre-Training for Zero-Shot Motion Tracking
+### [CVPR 2026] Scaling Data and Structure for Zero-Shot Motion Tracking
 
 <p align="center">
   <a href="https://cvpr.thecvf.com/Conferences/2026"><img src="https://img.shields.io/badge/CVPR-2026-4b44ce.svg?style=flat-square" alt="CVPR 2026"></a>
@@ -66,7 +66,7 @@ The following features are planned for future implementation:
 ### Quick Start
 
 ```bash
-git clone https://github.com/qizekun/Humanoid-GPT.git
+git clone https://github.com/GalaxyGeneralRobotics/Humanoid-GPT.git
 cd Humanoid-GPT
 
 conda create -n h-gpt python=3.12 -y
@@ -162,8 +162,10 @@ Humanoid-GPT/
 
 ```bibtex
 @article{humanoid-gpt26,
-    title     = {Humanoid-GPT: Humanoid Generative Pre-Training for Zero-Shot Motion Tracking},
-    author    = {Qi, Zekun and Chen, Xuchuan and others},
+    title     = {Humanoid-GPT: Scaling Data and Structure for Zero-Shot Motion Tracking},
+    author    = {Qi, Zekun and Chen, Xuchuan and Liu, Dairu and Lin, Chenghuai and Lian, Yunrui and
+                 Liang, Sikai and Zhang, Zhikai and Guan, Yu and Wang, Jilong and Zhang, Wenyao and
+                 Yu, Xinqiang and Wang, He and Yi, Li},
     journal   = {arXiv preprint arXiv:2606.03985},
     year      = {2026}
 }

@@ -126,7 +126,7 @@ conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
 
 ```bash
 cd ~
-git clone https://github.com/<your-org>/Humanoid-GPT.git
+git clone https://github.com/GalaxyGeneralRobotics/Humanoid-GPT.git
 cd Humanoid-GPT
 ```
 
