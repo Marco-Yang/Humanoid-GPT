@@ -6,13 +6,21 @@ The PICO side (Unity app) must send UDP packets to this host/port in JSON:
       "t":    1234567890.123,        // UNIX timestamp (optional, float)
       "head": {"p": [x,y,z], "q": [w,x,y,z]},
       "lc":   {"p": [x,y,z], "q": [w,x,y,z], "trig": 0.0, "grip": 0.0, "joy": [jx, jy]},
-      "rc":   {"p": [x,y,z], "q": [w,x,y,z], "trig": 0.0, "grip": 0.0, "joy": [jx, jy]}
+      "rc":   {"p": [x,y,z], "q": [w,x,y,z], "trig": 0.0, "grip": 0.0, "joy": [jx, jy]},
+      "lf":   {"p": [x,y,z], "q": [w,x,y,z]},   // left foot tracker  (optional)
+      "rf":   {"p": [x,y,z], "q": [w,x,y,z]},   // right foot tracker (optional)
+      "wp":   {"p": [x,y,z], "q": [w,x,y,z]}    // waist/pelvis tracker (optional)
     }
 
 Coordinate convention expected from the PICO app (OpenXR stage space):
   - +Y up, -Z forward (direction the user faces at initialization), +X right
   - Positions in metres, quaternions as [w, x, y, z]
   - Origin: floor level below the user's initial head position
+
+Full-body tracking (PICO Motion Tracker):
+  When "lf" / "rf" / "wp" keys are present, PicoFrame carries the corresponding
+  foot and waist 6-DOF poses.  The retarget layer uses them to solve leg IK on
+  the G1.  When absent, leg joints fall back to the default standing pose.
 
 The retarget layer (retarget_pico.py) handles the frame conversion to the
 MuJoCo/robot world frame (+Z up, +X forward).
@@ -26,7 +34,7 @@ import json
 import socket
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -49,6 +57,13 @@ class PicoFrame:
     right_trigger: float
     right_grip: float
     right_joystick: np.ndarray
+    # Optional full-body trackers (PICO Motion Tracker / body tracking kit)
+    left_foot_pos:  np.ndarray | None = None  # (3,) or None if no foot tracker
+    left_foot_rot:  np.ndarray | None = None  # (4,) [w,x,y,z] or None
+    right_foot_pos: np.ndarray | None = None
+    right_foot_rot: np.ndarray | None = None
+    waist_pos:      np.ndarray | None = None  # pelvis tracker (optional)
+    waist_rot:      np.ndarray | None = None
 
 
 class PicoClient:
@@ -138,20 +153,33 @@ def _parse_packet(raw: bytes) -> PicoFrame | None:
         head = d["head"]
         lc   = d["lc"]
         rc   = d["rc"]
+
+        # Optional full-body trackers (absent when not using PICO Motion Tracker)
+        lf = d.get("lf")
+        rf = d.get("rf")
+        wp = d.get("wp")
+
         return PicoFrame(
-            timestamp     = float(d.get("t", time.time())),
-            head_pos      = _v3(head, "p"),
-            head_rot      = _v4(head, "q"),
-            left_pos      = _v3(lc, "p"),
-            left_rot      = _v4(lc, "q"),
-            left_trigger  = float(lc.get("trig", 0.0)),
-            left_grip     = float(lc.get("grip", 0.0)),
-            left_joystick = np.array(lc.get("joy", [0.0, 0.0]), dtype=np.float32),
-            right_pos     = _v3(rc, "p"),
-            right_rot     = _v4(rc, "q"),
-            right_trigger = float(rc.get("trig", 0.0)),
-            right_grip    = float(rc.get("grip", 0.0)),
-            right_joystick= np.array(rc.get("joy", [0.0, 0.0]), dtype=np.float32),
+            timestamp      = float(d.get("t", time.time())),
+            head_pos       = _v3(head, "p"),
+            head_rot       = _v4(head, "q"),
+            left_pos       = _v3(lc, "p"),
+            left_rot       = _v4(lc, "q"),
+            left_trigger   = float(lc.get("trig", 0.0)),
+            left_grip      = float(lc.get("grip", 0.0)),
+            left_joystick  = np.array(lc.get("joy", [0.0, 0.0]), dtype=np.float32),
+            right_pos      = _v3(rc, "p"),
+            right_rot      = _v4(rc, "q"),
+            right_trigger  = float(rc.get("trig", 0.0)),
+            right_grip     = float(rc.get("grip", 0.0)),
+            right_joystick = np.array(rc.get("joy", [0.0, 0.0]), dtype=np.float32),
+            # Foot and waist trackers (None when key absent)
+            left_foot_pos  = _v3(lf, "p") if lf else None,
+            left_foot_rot  = _v4(lf, "q") if lf else None,
+            right_foot_pos = _v3(rf, "p") if rf else None,
+            right_foot_rot = _v4(rf, "q") if rf else None,
+            waist_pos      = _v3(wp, "p") if wp else None,
+            waist_rot      = _v4(wp, "q") if wp else None,
         )
     except Exception as e:
         print(f"[PicoClient] packet parse error: {e}")
