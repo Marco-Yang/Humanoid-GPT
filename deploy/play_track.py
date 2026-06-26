@@ -412,6 +412,8 @@ def run_sim(args: "DeployArgs"):
                 xsens_host=args.xsens_host,
                 xsens_port=args.xsens_port,
                 xsens_protocol=args.xsens_protocol,
+                pico_host=args.pico_host,
+                pico_port=args.pico_port,
             )
             mocap_buffer = MocapBuffer(buf_mocap, ts_mocap)
             print("[Mocap] Retarget subprocess started.")
@@ -631,6 +633,8 @@ def run_real(args: "DeployArgs"):
         xsens_host=args.xsens_host,
         xsens_port=args.xsens_port,
         xsens_protocol=args.xsens_protocol,
+        pico_host=args.pico_host,
+        pico_port=args.pico_port,
     )
     mocap_buffer = MocapBuffer(buf_mocap, ts_mocap)
 
@@ -767,7 +771,7 @@ class DeployArgs:
 
     # Mocap
     no_mocap: bool = False
-    mocap_type: str = "pnlink"  # one of: pnlink | xsens
+    mocap_type: str = "pnlink"  # one of: pnlink | xsens | pico
     human_height: float = 1.7
     visualize_retarget: bool = True
     buffer_ms: float = 30.0
@@ -776,6 +780,12 @@ class DeployArgs:
     xsens_host: str = "0.0.0.0"      # local bind address for the receiver
     xsens_port: int = 9763           # default MVN Network Streamer port
     xsens_protocol: str = "tcp"      # "tcp" or "udp" - match MVN Studio setting
+
+    # PICO VR streamer (only used when --mocap_type pico).
+    # A Unity app on the PICO must send UDP pose packets to this host:port.
+    # See deploy/pico/client.py for the expected JSON packet format.
+    pico_host: str = "0.0.0.0"       # local bind address for the UDP receiver
+    pico_port: int = 9864             # must match the PICO Unity app setting
 
     # Real robot
     net: str = "enx6c1ff76e8ef5"

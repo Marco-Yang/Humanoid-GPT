@@ -48,6 +48,7 @@ def _retarget_worker(
     robot, actual_human_height, mocap_type,
     buffer_ms, rt_pin,
     xsens_host="0.0.0.0", xsens_port=9763, xsens_protocol="tcp",
+    pico_host="0.0.0.0", pico_port=9864,
 ):
     """Worker process: mocap -> GMR retarget -> shared memory.
 
@@ -68,6 +69,19 @@ def _retarget_worker(
         except (OSError, PermissionError):
             pass
 
+    _use_pico = (mocap_type or "").lower() == "pico"
+
+    if _use_pico:
+        _retarget_worker_pico(
+            buf, buf_hand, ts, ready_evt, stop_evt,
+            robot, actual_human_height, buffer_ms,
+            pico_host, pico_port,
+        )
+        return
+
+    # ------------------------------------------------------------------
+    # GMR path: Noitom PNLink or Xsens MVN
+    # ------------------------------------------------------------------
     from general_motion_retargeting import GeneralMotionRetargeting as GMR
 
     if (mocap_type or "").lower() == "xsens":
@@ -177,6 +191,76 @@ def _retarget_worker(
             client.stop()
 
 
+def _retarget_worker_pico(
+    buf, buf_hand, ts, ready_evt, stop_evt,
+    robot, actual_human_height, buffer_ms,
+    pico_host, pico_port,
+):
+    """Retarget subprocess for PICO VR backend (no GMR required).
+
+    Receives head + controller 6-DOF poses over UDP and produces qpos_full
+    via MuJoCo IK for the arm joints.  Leg joints stay at the default
+    standing pose; locomotion is driven by the walk policy instead.
+
+    Hand open/close is inferred from the controller trigger value:
+        buf_hand = [left_open, left_trigger, right_open, right_trigger]
+    where *_open = 1 when trigger < 0.3 (relaxed), 0 when gripping.
+    """
+    from deploy.pico.client import PicoClient
+    from deploy.pico.retarget_pico import PicoRetargeter
+
+    client = PicoClient(host=pico_host, port=pico_port)
+    client.start_thread()
+
+    retargeter = PicoRetargeter(
+        robot=robot,
+        actual_human_height=actual_human_height,
+    )
+
+    qpos_last = None
+    ema_alpha = 0.7   # slightly less smoothing than GMR path (PICO is ~72 Hz)
+
+    try:
+        while not stop_evt.is_set():
+            frame = client.get_frame_data(timeout=0.5)
+            if frame is None:
+                continue
+
+            # Hand: open when trigger is relaxed
+            l_open = float(frame.left_trigger  < 0.3)
+            r_open = float(frame.right_trigger < 0.3)
+            hand_data = np.array(
+                [l_open, frame.left_trigger, r_open, frame.right_trigger],
+                dtype=np.float32,
+            )
+            with buf_hand.get_lock():
+                np.frombuffer(buf_hand.get_obj(), dtype=np.float32)[:] = hand_data
+
+            # Retarget PICO → qpos_full
+            try:
+                qpos = retargeter.retarget(frame)
+            except Exception as e:
+                import traceback
+                print(f"[PicoRetarget] error: {e}\n{traceback.format_exc()}")
+                continue
+
+            # EMA smoothing
+            if qpos_last is not None:
+                qpos = qpos_last * ema_alpha + qpos * (1.0 - ema_alpha)
+            qpos_last = qpos.copy()
+
+            with buf.get_lock(), ts.get_lock():
+                np.frombuffer(
+                    buf.get_obj(), dtype=np.float32, count=qpos.size
+                )[:] = qpos
+                ts.value = time.time()
+
+            if not ready_evt.is_set():
+                ready_evt.set()
+    finally:
+        client.stop()
+
+
 def _visualize_worker(buf, stop_evt, robot="unitree_g1"):
     from general_motion_retargeting import RobotMotionViewer
     viewer = RobotMotionViewer(robot_type=robot, motion_fps=120.0)
@@ -197,6 +281,8 @@ def start_realtime_retarget(
     xsens_host: str = "0.0.0.0",
     xsens_port: int = 9763,
     xsens_protocol: str = "tcp",
+    pico_host: str = "0.0.0.0",
+    pico_port: int = 9864,
 ) -> tuple[SynchronizedArray, ...]:
     """Launch retarget worker and return shared buffers.
 
@@ -227,7 +313,8 @@ def start_realtime_retarget(
         target=_retarget_worker,
         args=(buf, buf_hand, ts, ready_evt, stop_evt,
               robot, actual_human_height, mocap_type, buffer_ms, rt_pin,
-              xsens_host, xsens_port, xsens_protocol),
+              xsens_host, xsens_port, xsens_protocol,
+              pico_host, pico_port),
         daemon=True,
     )
     p.start()
