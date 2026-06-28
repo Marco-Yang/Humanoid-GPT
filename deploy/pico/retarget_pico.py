@@ -1,18 +1,26 @@
 """Convert PICO VR pose data to G1 robot qpos_full (36-D).
 
-Supports two modes:
-  • Arms-only (head + 2 controllers):
-      - Root orientation from head yaw; XY fixed at 0; Z fixed at 0.78 m.
-      - Waist pitch follows head pitch; waist yaw absorbed into root quat.
-      - Arms: 7-DOF per arm via damped-LS Jacobian IK in MuJoCo.
-      - Legs: held at default standing pose.
+Supports two arm-tracking modes (auto-selected each frame):
 
-  • Full-body (head + 2 controllers + 2 foot trackers, optional waist tracker):
-      - Root Z height tracks squat depth estimated from head/waist.
-      - Legs: 6-DOF per leg via Jacobian IK; ankle targets derived from
-              foot-tracker positions expressed relative to estimated root.
-      - Arms: same Jacobian IK as arms-only mode.
-      - Gracefully degrades to arms-only if foot data absent.
+  • Body-joint arms (SONIC-style, preferred when body tracking active):
+      - Uses SMPL body joints 22/23 (left/right wrist) from PICO body tracking.
+      - Non-mirror, egocentric: user's left arm drives robot's left arm.
+      - Calibrated by pressing BOTH grips (left_grip + right_grip > 0.5)
+        while in T-pose; default pose held until then.
+        Captures inv(neck_rot) and wrist offsets vs G1 FK defaults
+        (follows SONIC ThreePointPose calibration logic).
+      - No arm_scale in body-joint mode; controller fallback still uses scale.
+
+  • Controller arms (fallback when body tracking absent):
+      - Uses controller positions relative to HMD head.
+      - Same egocentric convention as body-joint mode.
+
+Leg tracking (requires foot trackers):
+  • Full-body (head + foot trackers + waist tracker):
+      - Root Z height from waist tracker (joint 0) with leg_scale.
+      - Legs: 6-DOF per leg via Jacobian IK; ankle targets from foot-tracker
+              positions (joints 10/11) relative to estimated root.
+  • Gracefully degrades to default standing pose if foot data absent.
 
 Foot-to-root IK formulation
 ----------------------------
@@ -27,11 +35,12 @@ and lateral/forward steps (foot moves in XZ → ankle moves in robot Y/X).
 Coordinate frames
 -----------------
 PICO world (OpenXR stage space):  +Y up,  -Z forward,  +X right
+  User faces -Z; user's RIGHT side = PICO +X, user's LEFT side = PICO -X.
 MuJoCo/Robot world:               +Z up,  +X forward,  +Y left
 
 The rotation matrix from PICO→Robot is:
     R[0,:] = [0, 0, -1]   robot +X = -PICO Z  (forward)
-    R[1,:] = [-1, 0,  0]  robot +Y = -PICO X  (left)
+    R[1,:] = [-1, 0,  0]  robot +Y = -PICO X  (user left → robot left)
     R[2,:] = [0, 1,  0]   robot +Z =  PICO Y  (up)
 """
 
@@ -39,6 +48,7 @@ from __future__ import annotations
 
 import numpy as np
 import mujoco
+from scipy.spatial.transform import Rotation as _SRot
 
 from tracking import constants as consts
 from deploy.pico.client import PicoFrame
@@ -92,16 +102,12 @@ _PELVIS_HEIGHT_FRAC = 0.52
 # PICO → MuJoCo world rotation (see module docstring)
 R_PICO2ROBOT = np.array([
     [0., 0., -1.],
-    [-1., 0., 0.],
+    [-1., 0., 0.],   # PICO -X (user's left) → robot +Y (robot's left)
     [0., 1., 0.],
 ], dtype=np.float32)
 
 # Scale: human arm reach (~0.65 m) → robot arm reach from shoulder (~0.50 m)
 _ARM_SCALE = 0.50 / 0.65
-
-# Shoulder offset from chest in robot frame (+Y = left, -Y = right)
-_CHEST_TO_L_SHOULDER = np.array([0.0, 0.18, 0.10], dtype=np.float32)
-_CHEST_TO_R_SHOULDER = np.array([0.0, -0.18, 0.10], dtype=np.float32)
 
 # IK hyper-parameters
 _IK_MAX_ITER = 30
@@ -156,8 +162,8 @@ def _limb_ik(
     q_default: np.ndarray,
 ) -> None:
     """Damped-Jacobian IK in-place on mj_data.qpos. Works for arms and legs."""
-    nv  = mj_model.nv
-    n   = len(qvel_ids)
+    nv = mj_model.nv
+    n = len(qvel_ids)
     jacp = np.zeros((3, nv))
     jacr = np.zeros((3, nv))
 
@@ -205,7 +211,7 @@ class PicoRetargeter:
         robot: str = "unitree_g1",  # reserved for future multi-robot support
         actual_human_height: float = 1.7,
     ) -> None:
-        del robot  # XML path comes from consts.TRACK_XML (already robot-specific)
+        del robot  # XML path from consts.TRACK_XML (robot-specific)
         xml_path = str(consts.TRACK_XML)
         self._mj_model = mujoco.MjModel.from_xml_path(xml_path)
         self._mj_model.opt.timestep = 0.001
@@ -223,57 +229,108 @@ class PicoRetargeter:
         self._l_leg_default = _DEFAULT_QPOS[_L_LEG_QPOS].copy()
         self._r_leg_default = _DEFAULT_QPOS[_R_LEG_QPOS].copy()
 
-        # Default ankle positions in robot world frame (from forward kinematics)
+        # Default end-effector positions in robot world frame (FK)
         self._mj_data.qpos[:] = _DEFAULT_QPOS
         mujoco.mj_forward(self._mj_model, self._mj_data)
         self._default_l_ankle = self._mj_data.xpos[self._l_ankle_id].copy()
         self._default_r_ankle = self._mj_data.xpos[self._r_ankle_id].copy()
+        self._default_l_wrist = self._mj_data.xpos[self._l_wrist_id].copy()
+        self._default_r_wrist = self._mj_data.xpos[self._r_wrist_id].copy()
 
         # Arm reach scale
         self._arm_scale = _ARM_SCALE * (actual_human_height / 1.70)
 
-        # Leg scale: robot vertical leg length / expected PICO vertical leg length.
-        # Calibrated from actual foot data on first frame; pre-seeded from height.
-        robot_vleg = float(_DEFAULT_QPOS[2] - self._default_l_ankle[2])
+        # Robot vertical leg length (pelvis Z above ankle Z in default pose).
+        # Used to compute leg_scale once calibrated foot positions are known.
+        self._robot_vleg = float(_DEFAULT_QPOS[2] - self._default_l_ankle[2])
+        # Pre-seeded leg scale (refined on first frame from actual PICO data)
         pico_vleg_est = actual_human_height * _PELVIS_HEIGHT_FRAC
-        self._leg_scale = robot_vleg / max(pico_vleg_est, 0.1)
+        self._leg_scale = self._robot_vleg / max(pico_vleg_est, 0.1)
 
-        # Calibration state (set on first frame)
+        # Head calibration (first frame — only for yaw/head-height fallback)
         self._calib_head_pos: np.ndarray | None = None
+        # Pelvis Y in PICO at calibration; from waist tracker or estimate
+        self._calib_root_y: float = actual_human_height * _PELVIS_HEIGHT_FRAC
+
+        # Leg calibration (button-triggered: both triggers for 5 frames).
+        # Legs hold default pose until calibration fires.
         self._calib_lf_pico: np.ndarray | None = None
         self._calib_rf_pico: np.ndarray | None = None
-        # Estimated pelvis Y in PICO frame at calibration (Y-up, floor = 0)
-        self._calib_root_y: float = actual_human_height * _PELVIS_HEIGHT_FRAC
+        self._triggers_down_count: int = 0
+
+        # Controller-delta arm calibration (captured at leg calibration time).
+        # Stores (controller - waist) at the neutral pose so arm tracking
+        # computes the DELTA from neutral → applied to default wrist position.
+        self._calib_lc_rel: np.ndarray | None = None  # (3,) PICO frame
+        self._calib_rc_rel: np.ndarray | None = None
+
+        # SMPL body-joint arm calibration (both grips, requires SDK wrist data).
+        # Dead path with TCP-only stream; kept for future SDK compatibility.
+        self._calib_neck_inv = None         # _SRot | None
+        self._calib_lw_offset: np.ndarray | None = None  # (3,) robot frame
+        self._calib_rw_offset: np.ndarray | None = None
+        self._grips_down_count: int = 0
+
+        # Default wrist body-local (relative to robot root at DEFAULT_QPOS).
+        # Used as the arm target baseline before any arm delta is applied.
+        _def_root = _DEFAULT_QPOS[:3].copy()
+        self._default_l_wrist_rel = self._default_l_wrist - _def_root
+        self._default_r_wrist_rel = self._default_r_wrist - _def_root
+
+        # IK warm start: carry previous frame's joint solution
+        self._prev_qpos: np.ndarray | None = None
+
+        print(
+            "[PicoRetargeter] Both TRIGGERS = leg calibration (stand still)."
+        )
+        print(
+            "[PicoRetargeter] Both GRIPS    = arm calibration (T-pose)."
+        )
 
     # ------------------------------------------------------------------
 
     def reset(self) -> None:
-        """Re-calibrate on next frame."""
+        """Clear all calibration; next button presses re-calibrate."""
         self._calib_head_pos = None
         self._calib_lf_pico = None
         self._calib_rf_pico = None
+        self._calib_lc_rel = None
+        self._calib_rc_rel = None
+        self._calib_neck_inv = None
+        self._calib_lw_offset = None
+        self._calib_rw_offset = None
+        self._grips_down_count = 0
+        self._triggers_down_count = 0
+        self._prev_qpos = None
 
     def retarget(self, frame: PicoFrame) -> np.ndarray:
         """Convert a PicoFrame to qpos_full (36,).
 
         Layout: [root_xyz(3), root_quat(4), joints(29)]
         """
-        # --- 1. Calibrate on first frame ---
+        # --- 1. Head calibration (first frame only) ---
         if self._calib_head_pos is None:
             self._calib_head_pos = frame.head_pos.copy()
-            if frame.left_foot_pos is not None:
-                self._calib_lf_pico = frame.left_foot_pos.copy()
-                self._calib_rf_pico = frame.right_foot_pos.copy()
-                # Refine leg scale from actual foot positions
-                feet_avg_y = float(
-                    (frame.left_foot_pos[1] + frame.right_foot_pos[1]) / 2.0
-                )
-                pico_vleg = self._calib_root_y - feet_avg_y
-                robot_vleg = float(_DEFAULT_QPOS[2] - self._default_l_ankle[2])
-                self._leg_scale = robot_vleg / max(pico_vleg, 0.05)
 
-        # --- 2. Base qpos ---
-        qpos = _DEFAULT_QPOS.copy()
+        # --- 1b. Leg calibration (both triggers held for 5 frames) ---
+        triggers_down = (
+            frame.left_trigger > 0.5 and frame.right_trigger > 0.5
+        )
+        if triggers_down:
+            self._triggers_down_count += 1
+            if (self._triggers_down_count == 5
+                    and frame.left_foot_pos is not None
+                    and frame.waist_pos is not None):
+                self._capture_leg_calibration(frame)
+                self._triggers_down_count = 100  # prevent re-trigger
+        else:
+            self._triggers_down_count = 0
+
+        # --- 2. Base qpos (warm start from previous IK solution) ---
+        if self._prev_qpos is not None:
+            qpos = self._prev_qpos.copy()
+        else:
+            qpos = _DEFAULT_QPOS.copy()
 
         # --- 3. Root orientation (head yaw → robot root yaw around Z) ---
         head_yaw = _quat_to_yaw_pico(frame.head_rot)
@@ -287,18 +344,17 @@ class PicoRetargeter:
             np.clip(head_pitch * 0.5, lo_wp, hi_wp)
         )
 
-        # --- 5. Root height: estimate from head (or waist tracker) ---
+        # --- 5. Root height ---
+        # joint 0 (waist_pos) = pelvis tracker → use directly when available.
+        # Fallback: track head displacement (pelvis follows head in squat).
         if frame.waist_pos is not None:
             current_root_y = float(frame.waist_pos[1])
         else:
-            # Root moves proportionally with head when squatting
-            ratio = self._calib_root_y / max(
-                float(self._calib_head_pos[1]), 0.1
-            )
-            current_root_y = float(frame.head_pos[1]) * ratio
-
-        root_z = float(_DEFAULT_QPOS[2]) + (
-            (current_root_y - self._calib_root_y) * self._leg_scale
+            dh = float(frame.head_pos[1]) - float(self._calib_head_pos[1])
+            current_root_y = self._calib_root_y + dh
+        root_z = (
+            float(_DEFAULT_QPOS[2])
+            + (current_root_y - self._calib_root_y) * self._leg_scale
         )
         qpos[2] = max(root_z, 0.50)  # safety floor
 
@@ -315,14 +371,24 @@ class PicoRetargeter:
 
             # foot-to-root vectors in PICO frame → ankle targets in robot frame
             # ankle_tgt = root_robot - R @ (root_pico - foot_pico) * scale
-            root_pico = np.array(
-                [float(self._calib_lf_pico[0] + self._calib_rf_pico[0])
-                 / 2.0,
-                 current_root_y,
-                 float(self._calib_lf_pico[2] + self._calib_rf_pico[2])
-                 / 2.0],
-                dtype=np.float64,
-            )
+            # Use live waist X/Z so relative vector is correct even when user
+            # has walked from the calibration position.
+            if frame.waist_pos is not None:
+                root_pico = np.array([
+                    float(frame.waist_pos[0]),
+                    current_root_y,
+                    float(frame.waist_pos[2]),
+                ], dtype=np.float64)
+            else:
+                root_pico = np.array([
+                    float(
+                        self._calib_lf_pico[0] + self._calib_rf_pico[0]
+                    ) / 2.0,
+                    current_root_y,
+                    float(
+                        self._calib_lf_pico[2] + self._calib_rf_pico[2]
+                    ) / 2.0,
+                ], dtype=np.float64)
             lf2root = root_pico - frame.left_foot_pos.astype(np.float64)
             rf2root = root_pico - frame.right_foot_pos.astype(np.float64)
 
@@ -354,17 +420,67 @@ class PicoRetargeter:
             qpos[_R_LEG_QPOS] = self._mj_data.qpos[_R_LEG_QPOS]
 
         # --- 7. Arm IK ---
-        chest_robot = np.array([0.0, 0.0, qpos[2]], dtype=np.float32)
+        # SONIC-style: press both grips for 5 consecutive frames to calibrate.
+        grips_down = frame.left_grip > 0.5 and frame.right_grip > 0.5
+        if grips_down:
+            self._grips_down_count += 1
+            if (self._grips_down_count == 5
+                    and frame.left_wrist_pos is not None
+                    and frame.waist_pos is not None
+                    and frame.neck_rot is not None):
+                self._capture_arm_calibration(frame)
+                self._grips_down_count = 100  # prevent re-trigger while held
+        else:
+            self._grips_down_count = 0
 
-        l_off = (R_PICO2ROBOT @ (frame.left_pos - frame.head_pos)
-                 .astype(np.float64)).astype(np.float32)
-        r_off = (R_PICO2ROBOT @ (frame.right_pos - frame.head_pos)
-                 .astype(np.float64)).astype(np.float32)
+        # Prefer SONIC-style body joint tracking when calibrated.
+        has_body_arms = (
+            frame.left_wrist_pos is not None
+            and frame.waist_pos is not None
+            and self._calib_neck_inv is not None
+        )
 
-        l_target = (chest_robot + _CHEST_TO_L_SHOULDER
-                    + l_off * self._arm_scale)
-        r_target = (chest_robot + _CHEST_TO_R_SHOULDER
-                    + r_off * self._arm_scale)
+        if has_body_arms:
+            # Wrist-to-waist in robot frame (non-mirror via R_PICO2ROBOT)
+            lw_rel = (
+                R_PICO2ROBOT.astype(np.float64)
+                @ (frame.left_wrist_pos - frame.waist_pos).astype(np.float64)
+            )
+            rw_rel = (
+                R_PICO2ROBOT.astype(np.float64)
+                @ (frame.right_wrist_pos - frame.waist_pos).astype(np.float64)
+            )
+            # Apply neck-inverse (SONIC ThreePointPose._apply_calibration),
+            # subtract stored offset → body-local wrist target in robot frame.
+            # Result = g1_fk_default_rel + neck_inv.apply(delta_from_calib_pos)
+            lw_cal = (
+                self._calib_neck_inv.apply(lw_rel) - self._calib_lw_offset
+            )
+            rw_cal = (
+                self._calib_neck_inv.apply(rw_rel) - self._calib_rw_offset
+            )
+            # Convert body-local → world by adding current root XYZ
+            root_xyz = qpos[:3].astype(np.float64)
+            l_target = (lw_cal + root_xyz).astype(np.float32)
+            r_target = (rw_cal + root_xyz).astype(np.float32)
+        elif (self._calib_lc_rel is not None and frame.waist_pos is not None):
+            # Controller-delta arm tracking (waist-relative, calibrated neutral).
+            # Mirrors SONIC ThreePointPose body-local delta approach but using
+            # controller positions instead of body-joint wrist positions.
+            R = R_PICO2ROBOT.astype(np.float64)
+            wp = frame.waist_pos.astype(np.float64)
+            lc_rel = frame.left_pos.astype(np.float64) - wp
+            rc_rel = frame.right_pos.astype(np.float64) - wp
+            delta_l = R @ (lc_rel - self._calib_lc_rel) * self._arm_scale
+            delta_r = R @ (rc_rel - self._calib_rc_rel) * self._arm_scale
+            root_xyz = qpos[:3].astype(np.float64)
+            l_target = (self._default_l_wrist_rel + delta_l + root_xyz).astype(np.float32)
+            r_target = (self._default_r_wrist_rel + delta_r + root_xyz).astype(np.float32)
+        else:
+            # No calibration yet — hold default wrist positions
+            root_xyz = qpos[:3].astype(np.float64)
+            l_target = (self._default_l_wrist_rel + root_xyz).astype(np.float32)
+            r_target = (self._default_r_wrist_rel + root_xyz).astype(np.float32)
 
         # Re-seed MuJoCo with solved leg state before arm IK
         self._mj_data.qpos[:] = qpos
@@ -385,7 +501,89 @@ class PicoRetargeter:
         qpos[_L_ARM_QPOS] = self._mj_data.qpos[_L_ARM_QPOS]
         qpos[_R_ARM_QPOS] = self._mj_data.qpos[_R_ARM_QPOS]
 
+        self._prev_qpos = qpos.copy()
         return qpos.astype(np.float32)
+
+    # ------------------------------------------------------------------
+
+    def _capture_leg_calibration(self, frame: PicoFrame) -> None:
+        """Capture neutral-stance reference for both leg IK and arm tracking.
+
+        Call while standing still with arms in natural resting position.
+        - Legs: captures foot & waist positions → sets leg_scale
+        - Arms: captures controller positions relative to waist → used as
+          the 'neutral' baseline for controller-delta arm tracking
+        """
+        assert frame.left_foot_pos is not None
+        assert frame.waist_pos is not None
+
+        # Leg calibration
+        self._calib_lf_pico = frame.left_foot_pos.copy()
+        self._calib_rf_pico = frame.right_foot_pos.copy()
+        feet_avg_y = float(
+            (frame.left_foot_pos[1] + frame.right_foot_pos[1]) / 2.0
+        )
+        self._calib_root_y = float(frame.waist_pos[1])
+        pico_vleg = self._calib_root_y - feet_avg_y
+        self._leg_scale = self._robot_vleg / max(pico_vleg, 0.05)
+
+        # Arm neutral: controller position relative to waist in PICO frame
+        wp = frame.waist_pos.astype(np.float64)
+        self._calib_lc_rel = (frame.left_pos.astype(np.float64) - wp)
+        self._calib_rc_rel = (frame.right_pos.astype(np.float64) - wp)
+        lo = self._calib_lc_rel
+        ro = self._calib_rc_rel
+        print(
+            f"[PicoRetargeter] Leg calibration done. "
+            f"vleg={pico_vleg:.3f}  scale={self._leg_scale:.3f}  "
+            f"L-ctrl [{lo[0]:.2f},{lo[1]:.2f},{lo[2]:.2f}]  "
+            f"R-ctrl [{ro[0]:.2f},{ro[1]:.2f},{ro[2]:.2f}]"
+        )
+
+    def _capture_arm_calibration(self, frame: PicoFrame) -> None:
+        """SONIC ThreePointPose-style arm calibration (button-triggered).
+
+        Call while in T-pose (arms extended sideways, body upright).
+        Stores inv(neck_rot) and wrist offsets relative to G1 FK defaults so
+        that _apply_calibration yields: target = g1_fk_rel + neck_inv(delta).
+        """
+        assert frame.neck_rot is not None
+        assert frame.left_wrist_pos is not None
+        assert frame.waist_pos is not None
+
+        R = R_PICO2ROBOT.astype(np.float64)
+
+        # Neck orientation in robot frame (conjugate similarity transform)
+        neck_pico = _SRot.from_quat(frame.neck_rot, scalar_first=True)
+        neck_robot = _SRot.from_matrix(
+            R @ neck_pico.as_matrix() @ R.T
+        )
+        self._calib_neck_inv = neck_robot.inv()
+
+        # Wrist-to-waist vectors in robot frame
+        lw_rel = R @ (frame.left_wrist_pos - frame.waist_pos).astype(
+            np.float64
+        )
+        rw_rel = R @ (frame.right_wrist_pos - frame.waist_pos).astype(
+            np.float64
+        )
+
+        # Apply neck-inverse (same as SONIC _capture_calibration step 2)
+        lw_corr = self._calib_neck_inv.apply(lw_rel)
+        rw_corr = self._calib_neck_inv.apply(rw_rel)
+
+        # offset = neck_inv(calib_rel) - g1_fk_rel
+        # tracking: neck_inv(cur_rel) - offset = g1_fk_rel + neck_inv(delta)
+        self._calib_lw_offset = lw_corr - self._default_l_wrist_rel
+        self._calib_rw_offset = rw_corr - self._default_r_wrist_rel
+
+        lo = self._calib_lw_offset
+        ro = self._calib_rw_offset
+        print(
+            f"[PicoRetargeter] Arm calibration done. "
+            f"L-off [{lo[0]:.3f},{lo[1]:.3f},{lo[2]:.3f}] "
+            f"R-off [{ro[0]:.3f},{ro[1]:.3f},{ro[2]:.3f}]"
+        )
 
 
 # -----------------------------------------------------------------------
